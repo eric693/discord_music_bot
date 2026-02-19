@@ -1,4 +1,4 @@
-app = "music_v1-discord-bot"  # 改成你想要的名稱（全球唯一）
+app = "musssadasdic_v1-discord-bot"  #（全球唯一）
 primary_region = "nrt"    # 東京，對台灣最近
 
 [build]
