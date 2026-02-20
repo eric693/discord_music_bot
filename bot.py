@@ -935,7 +935,7 @@ class _PingHandler(BaseHTTPRequestHandler):
         pass
 
 def _run_keepalive():
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "10000"))  # Render 預設用 10000
     server = HTTPServer(("0.0.0.0", port), _PingHandler)
     server.serve_forever()
 
