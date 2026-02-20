@@ -73,10 +73,12 @@ def utc_month_str():
 YDL_OPTS = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
-    "noplaylist": True,    # 只取單首，忽略 &list= 參數
+    "noplaylist": True,
     "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
+    # ✅ YouTube 反爬蟲：提供登入 cookies 避免 "Sign in to confirm you're not a bot"
+    "cookiefile": "/app/cookies.txt" if os.path.exists("/app/cookies.txt") else None,
 }
 
 FFMPEG_OPTS = {
