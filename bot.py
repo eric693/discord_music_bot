@@ -73,7 +73,8 @@ def utc_month_str():
 YDL_OPTS = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
-    "noplaylist": True,
+    "noplaylist": True,    # 只取單首，忽略 &list= 參數
+    "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
 }
@@ -112,6 +113,12 @@ def get_state(guild_id: int) -> GuildMusicState:
 # =========================
 async def ytdlp_extract(query_or_url: str) -> Track:
     loop = asyncio.get_running_loop()
+
+    # ✅ 如果是 YouTube URL 帶有 &list= 播放清單參數，只保留單首影片的 v= 參數
+    import re
+    yt_match = re.match(r'https?://(?:www\.)?youtube\.com/watch\?.*?v=([\w-]+)', query_or_url)
+    if yt_match:
+        query_or_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
 
     def _extract():
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
