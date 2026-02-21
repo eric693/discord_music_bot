@@ -77,13 +77,10 @@ YDL_OPTS = {
     "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
-    # ✅ 用 cookies 繞過 bot 驗證（如果有的話）
-    "cookiefile": "/app/cookies.txt" if os.path.exists("/app/cookies.txt") else None,
-    # ✅ 跳過需要 JS runtime 的格式，只取不需要解密的串流
+    # ✅ 使用 tv_embedded + mweb client，不需要登入，繞過 bot 驗證
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
-            "player_skip": ["webpage", "configs"],
+            "player_client": ["tv_embedded", "mweb"],
         }
     },
 }
