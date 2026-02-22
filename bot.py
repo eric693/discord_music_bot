@@ -77,10 +77,11 @@ YDL_OPTS = {
     "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
-    # ✅ 多個 client fallback，繞過 YouTube bot 驗證
+    # ✅ cookies + ios client（最穩定的組合）
+    "cookiefile": "/app/cookies.txt" if os.path.exists("/app/cookies.txt") else None,
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_embedded", "ios", "mweb", "web"],
+            "player_client": ["ios", "web"],
         }
     },
 }
