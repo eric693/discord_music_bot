@@ -77,10 +77,10 @@ YDL_OPTS = {
     "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
-    # ✅ 使用 tv_embedded + mweb client，不需要登入，繞過 bot 驗證
+    # ✅ 多個 client fallback，繞過 YouTube bot 驗證
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_embedded", "mweb"],
+            "player_client": ["tv_embedded", "ios", "mweb", "web"],
         }
     },
 }
@@ -918,23 +918,23 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # =========================
-# Keep-alive (防止 Render 冷啟動造成 10062 錯誤)
+# Keep-alive（用 aiohttp 在 asyncio 主循環跑，Render 必須有 HTTP 回應）
 # =========================
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+from aiohttp import web as aio_web
 
-class _PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass
+async def _keepalive_server():
+    port = int(os.getenv("PORT", "10000"))
+    app = aio_web.Application()
+    app.router.add_get("/", lambda r: aio_web.Response(text="OK"))
+    runner = aio_web.AppRunner(app)
+    await runner.setup()
+    site = aio_web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[keepalive] HTTP server running on port {port}")
 
-def _run_keepalive():
-    port = int(os.getenv("PORT", "10000"))  # Render 預設用 10000
-    server = HTTPServer(("0.0.0.0", port), _PingHandler)
-    server.serve_forever()
+async def main():
+    await _keepalive_server()
+    await bot.start(TOKEN)
 
 # =========================
 # Run
@@ -942,6 +942,4 @@ def _run_keepalive():
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN not set in .env")
-    t = threading.Thread(target=_run_keepalive, daemon=True)
-    t.start()
-    bot.run(TOKEN, reconnect=True)
+    asyncio.run(main())
