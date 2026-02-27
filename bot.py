@@ -17,8 +17,10 @@ import yt_dlp
 # =========================
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
 AUTO_VC_GUILD_ID = int(os.getenv("AUTO_VC_GUILD_ID", "0"))
+AUTO_VC_CHANNEL_ID = int(os.getenv("AUTO_VC_CHANNEL_ID", "0"))  # ✅ NEW
 
 DRIVE_FILE_ID = "1ZIsyyKutbOVSeeXSWbJgwVY1zOIRVjL2"
 WELCOME_IMAGE_URL = f"https://drive.google.com/uc?export=view&id={DRIVE_FILE_ID}"
@@ -74,22 +76,25 @@ YDL_OPTS = {
     "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
     "noplaylist": True,
-    "yes_playlist": False,
     "default_search": "ytsearch",
     "extract_flat": False,
-    # ✅ cookies + ios client（最穩定的組合）
-    "cookiefile": "/app/cookies.txt" if os.path.exists("/app/cookies.txt") else None,
     "extractor_args": {
         "youtube": {
             "player_client": ["ios", "web"],
         }
     },
 }
+# ✅ only add cookiefile if exists (avoid cookiefile=None causing extract fail)
+if os.path.exists("/app/cookies.txt"):
+    YDL_OPTS["cookiefile"] = "/app/cookies.txt"
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+
+# ✅ fallback keyword (if radio empty)
+DEFAULT_AUTOPLAY_QUERY = os.getenv("DEFAULT_AUTOPLAY_QUERY", "lofi hip hop")
 
 @dataclass
 class Track:
@@ -121,7 +126,7 @@ def get_state(guild_id: int) -> GuildMusicState:
 async def ytdlp_extract(query_or_url: str) -> Track:
     loop = asyncio.get_running_loop()
 
-    # ✅ 如果是 YouTube URL 帶有 &list= 播放清單參數，只保留單首影片的 v= 參數
+    # If URL contains playlist param, strip to single video id (v=)
     import re
     yt_match = re.match(r'https?://(?:www\.)?youtube\.com/watch\?.*?v=([\w-]+)', query_or_url)
     if yt_match:
@@ -184,16 +189,18 @@ async def safe_connect(channel: discord.VoiceChannel, guild: discord.Guild):
     """Safe connect that clears stale sessions (fixes 4006 errors)"""
     vc = guild.voice_client
     if vc and vc.is_connected():
-        if vc.channel.id == channel.id:
+        if vc.channel and vc.channel.id == channel.id:
             return vc
         await vc.move_to(channel)
         return guild.voice_client
+
     if vc is not None:
         try:
             await vc.disconnect(force=True)
         except Exception:
             pass
         await asyncio.sleep(0.5)
+
     try:
         return await asyncio.wait_for(channel.connect(), timeout=15)
     except Exception as e:
@@ -320,7 +327,8 @@ async def radio_fill_queue(guild: discord.Guild, count: int = 3) -> bool:
             track = await ytdlp_extract(q)
             state.queue.append(track)
             added += 1
-        except Exception:
+        except Exception as e:
+            print(f"[radio_fill_queue] extract fail: {e}")
             continue
     return added > 0
 
@@ -366,30 +374,43 @@ async def play_next(guild: discord.Guild):
     try:
         vc = guild.voice_client
         if not vc or not vc.is_connected():
+            state.is_playing_next = False
             return
         if vc.is_playing() or vc.is_paused():
+            state.is_playing_next = False
             return
 
-        # 單曲循環
+        # loop current track
         if state.loop and state.current_track:
             state.queue.appendleft(state.current_track)
 
         if not state.queue:
-            # 1. Radio list
+            # 1) try radio list
             ok = await radio_fill_queue(guild, count=3)
+
+            # 2) if radio empty, fallback query (guarantee start)
             if not ok:
-                # 2. Autoplay
-                if state.autoplay and state.current_track:
-                    related = await ytdlp_related(state.current_track.webpage_url)
-                    if related:
-                        state.queue.append(related)
+                try:
+                    track = await ytdlp_extract(DEFAULT_AUTOPLAY_QUERY)
+                    state.queue.append(track)
+                    ok = True
+                except Exception as e:
+                    print(f"[play_next] fallback extract fail: {e}")
+
+            # 3) if still empty and autoplay enabled, try related from current track
+            if (not state.queue) and state.autoplay and state.current_track:
+                related = await ytdlp_related(state.current_track.webpage_url)
+                if related:
+                    state.queue.append(related)
 
         if not state.queue:
             state.is_playing_next = False
+            print("[play_next] queue empty, nothing to play")
             return
 
         track = state.queue.popleft()
         state.current_track = track
+
         source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTS)
 
         def _after(err):
@@ -442,12 +463,37 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     await init_db()
+
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")
     except Exception as e:
         print("Sync failed:", e)
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[env] AUTO_VC_GUILD_ID={AUTO_VC_GUILD_ID}, AUTO_VC_CHANNEL_ID={AUTO_VC_CHANNEL_ID}")
+
+    # ✅ Auto join on startup (no need anyone to join VC)
+    if AUTO_VC_GUILD_ID and AUTO_VC_CHANNEL_ID:
+        guild = bot.get_guild(AUTO_VC_GUILD_ID)
+        if not guild:
+            print("[auto_vc] guild not found. Check AUTO_VC_GUILD_ID")
+            return
+
+        ch = guild.get_channel(AUTO_VC_CHANNEL_ID)
+        if not isinstance(ch, discord.VoiceChannel):
+            print("[auto_vc] AUTO_VC_CHANNEL_ID is not a voice channel. Check ID")
+            return
+
+        vc = await safe_connect(ch, guild)
+        if vc:
+            state = get_state(guild.id)
+            if state.text_channel_id is None:
+                state.text_channel_id = pick_default_text_channel(guild)
+            print("[auto_vc] connected, start autoplay")
+            await start_autoplay_if_needed(guild)
+        else:
+            print("[auto_vc] connect failed (permission / region / voice gateway?)")
 
 # =========================
 # Welcome
@@ -468,13 +514,11 @@ async def on_member_join(member: discord.Member):
     await ch.send(embed=embed)
 
 # =========================
-# Music channel: type song name directly (LunaBot /setup feature)
+# Music channel: type song name directly (/setup)
 # =========================
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if not message.guild:
+    if message.author.bot or not message.guild:
         return
 
     music_ch_id = await get_music_channel(message.guild.id)
@@ -491,9 +535,7 @@ async def on_message(message: discord.Message):
         member = message.author
         if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
             try:
-                await message.channel.send(
-                    f"{message.author.mention} 🎧 請先進入語音頻道再點歌！", delete_after=5
-                )
+                await message.channel.send(f"{message.author.mention} 🎧 請先進入語音頻道再點歌！", delete_after=5)
             except Exception:
                 pass
             return
@@ -507,7 +549,8 @@ async def on_message(message: discord.Message):
 
         try:
             track = await ytdlp_extract(query)
-        except Exception:
+        except Exception as e:
+            print(f"[on_message] ytdlp_extract fail: {e}")
             try:
                 await message.channel.send("❌ 找不到該歌曲，請換個關鍵字。", delete_after=5)
             except Exception:
@@ -526,7 +569,7 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # =========================
-# Voice state
+# Voice state (optional auto follow humans)
 # =========================
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -537,6 +580,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     guild = member.guild
 
+    # follow user join/move
     if after.channel and (before.channel != after.channel):
         old_task = _vc_join_tasks.get(guild.id)
         if old_task and not old_task.done():
@@ -545,12 +589,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         _vc_join_tasks[guild.id] = task
         return
 
+    # leave when no humans (unless 24/7 enabled)
     if before.channel and (before.channel != after.channel):
         vc = guild.voice_client
         if not vc or not vc.is_connected():
             return
         if vc.channel and vc.channel.id != before.channel.id:
             return
+
         humans = [m for m in vc.channel.members if not m.bot]
         if len(humans) == 0:
             if guild.id in always_on_guilds:
@@ -564,21 +610,18 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # =========================
 # Slash: Setup
 # =========================
-@bot.tree.command(name="setup", description="設定專屬音樂頻道 Setup music channel（在該頻道輸入歌名直接播）")
-@app_commands.describe(channel="指定為音樂請求頻道 / Select the music request channel")
+@bot.tree.command(name="setup", description="設定專屬音樂頻道（在該頻道輸入歌名直接播）")
+@app_commands.describe(channel="指定為音樂請求頻道")
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
 
     await set_music_channel(interaction.guild.id, channel.id)
-
     embed = discord.Embed(
-        title="🎵 音樂頻道設定完成 / Music Channel Ready",
+        title="🎵 音樂頻道設定完成",
         description=(
             f"已將 {channel.mention} 設為專屬音樂請求頻道。\n\n"
-            "**使用方式：**\n"
-            "直接在該頻道輸入歌名或 YouTube URL 即可播放！\n"
-            "Just type a song name or YouTube URL in that channel!"
+            "在該頻道直接輸入歌名或 YouTube URL 即可播放！"
         ),
         color=0x1DB954,
     )
@@ -587,7 +630,7 @@ async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
 # =========================
 # Slash: Check-in / Leaderboard
 # =========================
-@bot.tree.command(name="checkin", description="每日打卡 Daily check-in（一天一次 Once per day）")
+@bot.tree.command(name="checkin", description="每日打卡（一天一次）")
 async def checkin(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not interaction.guild or not interaction.user:
@@ -609,7 +652,7 @@ async def checkin(interaction: discord.Interaction):
     except aiosqlite.IntegrityError:
         await interaction.followup.send("你今天已經打過卡了。", ephemeral=True)
 
-@bot.tree.command(name="leaderboard", description="本月打卡前三名 Top 3 check-ins this month")
+@bot.tree.command(name="leaderboard", description="本月打卡前三名")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
     if not interaction.guild:
@@ -648,14 +691,13 @@ async def leaderboard(interaction: discord.Interaction):
 # =========================
 # Slash: Music controls
 # =========================
-@bot.tree.command(name="play", description="播放音樂 Play music（YouTube 關鍵字或 URL / keyword or URL）")
-@app_commands.describe(query="YouTube 關鍵字或 URL（支援中文搜尋 / keyword or URL）")
+@bot.tree.command(name="play", description="播放音樂（YouTube 關鍵字或 URL）")
+@app_commands.describe(query="YouTube 關鍵字或 URL（支援中文搜尋）")
 async def play(interaction: discord.Interaction, query: str):
-    # ✅ defer 必須是第一個 await，否則超過 3 秒 Discord 會丟 10062
     try:
         await interaction.response.defer()
     except Exception:
-        return  # interaction 已過期，直接放棄
+        return
 
     if not interaction.guild:
         return await interaction.followup.send("請在伺服器內使用。")
@@ -672,14 +714,12 @@ async def play(interaction: discord.Interaction, query: str):
         return await interaction.followup.send(msg)
 
     if vc is None:
-        return await interaction.followup.send(
-            "🎧 請先進入一個語音頻道，Bot 就會自動加入並播放！\n"
-            "Please join a voice channel first, then use `/play` again."
-        )
+        return await interaction.followup.send("🎧 請先進入語音頻道，再使用 `/play`。")
 
     try:
         track = await ytdlp_extract(query)
-    except Exception:
+    except Exception as e:
+        print(f"[slash /play] extract fail: {e}")
         return await interaction.followup.send("❌ 解析失敗：請換一個關鍵字或 URL。")
 
     state.queue.append(track)
@@ -688,7 +728,7 @@ async def play(interaction: discord.Interaction, query: str):
     if not vc.is_playing() and not vc.is_paused():
         await play_next(interaction.guild)
 
-@bot.tree.command(name="queue", description="查看播放清單 View queue")
+@bot.tree.command(name="queue", description="查看播放清單")
 async def queue_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -702,7 +742,7 @@ async def queue_cmd(interaction: discord.Interaction):
     more = f"\n... 還有 {len(items)-10} 首" if len(items) > 10 else ""
     await interaction.response.send_message("🎶 播放清單：\n" + "\n".join(lines) + more)
 
-@bot.tree.command(name="pause", description="暫停播放 Pause playback")
+@bot.tree.command(name="pause", description="暫停播放")
 async def pause(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -712,7 +752,7 @@ async def pause(interaction: discord.Interaction):
         return await interaction.response.send_message("⏸️ 已暫停。")
     await interaction.response.send_message("目前沒有在播放。", ephemeral=True)
 
-@bot.tree.command(name="resume", description="繼續播放 Resume playback")
+@bot.tree.command(name="resume", description="繼續播放")
 async def resume(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -722,7 +762,7 @@ async def resume(interaction: discord.Interaction):
         return await interaction.response.send_message("▶️ 已繼續。")
     await interaction.response.send_message("目前沒有暫停中的播放。", ephemeral=True)
 
-@bot.tree.command(name="skip", description="跳過目前歌曲 Skip current track")
+@bot.tree.command(name="skip", description="跳過目前歌曲")
 async def skip(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -734,7 +774,7 @@ async def skip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("⏭️ 已跳過。")
 
-@bot.tree.command(name="loop", description="單曲循環開關 Toggle loop")
+@bot.tree.command(name="loop", description="單曲循環開關")
 async def loop_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -743,16 +783,16 @@ async def loop_cmd(interaction: discord.Interaction):
     status = "🔁 已開啟單曲循環" if state.loop else "🔁 已關閉單曲循環"
     await interaction.response.send_message(status)
 
-@bot.tree.command(name="autoplay", description="自動選歌開關 Toggle autoplay（播完自動找相關歌曲）")
+@bot.tree.command(name="autoplay", description="自動選歌開關（播完自動找相關）")
 async def autoplay_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
     state = get_state(interaction.guild.id)
     state.autoplay = not state.autoplay
-    status = "✅ 已開啟 Autoplay：播完自動找相關歌曲" if state.autoplay else "❌ 已關閉 Autoplay"
+    status = "✅ 已開啟 Autoplay" if state.autoplay else "❌ 已關閉 Autoplay"
     await interaction.response.send_message(status)
 
-@bot.tree.command(name="clear", description="清空播放清單 Clear queue")
+@bot.tree.command(name="clear", description="清空播放清單")
 async def clear_queue(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -760,7 +800,7 @@ async def clear_queue(interaction: discord.Interaction):
     state.queue.clear()
     await interaction.response.send_message("🧹 播放清單已清空。")
 
-@bot.tree.command(name="stop", description="停止播放並退出語音 Stop and disconnect")
+@bot.tree.command(name="stop", description="停止播放並退出語音")
 async def stop(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -791,21 +831,14 @@ async def stop(interaction: discord.Interaction):
 # =========================
 # Slash: 24/7
 # =========================
-@bot.tree.command(name="24_7", description="24/7 背景播放 Background playback（語音沒人也不退出 Stay in VC always）")
-@app_commands.describe(mode="on/開啟 開 ── off/關閉 關")
+@bot.tree.command(name="24_7", description="24/7 背景播放（語音沒人也不退出）")
+@app_commands.describe(mode="on/開啟 或 off/關閉")
 async def always_on(interaction: discord.Interaction, mode: str):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
 
     mode = mode.lower().strip()
     if mode in ("on", "開", "開啟", "true", "1"):
-        mode = "on"
-    elif mode in ("off", "關", "關閉", "false", "0"):
-        mode = "off"
-    else:
-        return await interaction.response.send_message("請輸入 on（開啟）或 off（關閉）。", ephemeral=True)
-
-    if mode == "on":
         always_on_guilds.add(interaction.guild.id)
         await interaction.response.send_message("✅ 已開啟 24/7：語音沒人也會持續播放、不自動退出。")
         state = get_state(interaction.guild.id)
@@ -816,15 +849,17 @@ async def always_on(interaction: discord.Interaction, mode: str):
                 await start_autoplay_if_needed(interaction.guild)
         except Exception:
             await start_autoplay_if_needed(interaction.guild)
-    else:
+    elif mode in ("off", "關", "關閉", "false", "0"):
         always_on_guilds.discard(interaction.guild.id)
         await interaction.response.send_message("✅ 已關閉 24/7：語音沒人會自動退出。")
+    else:
+        await interaction.response.send_message("請輸入 on（開啟）或 off（關閉）。", ephemeral=True)
 
 # =========================
 # Slash: Radio
 # =========================
-@bot.tree.command(name="radio_add", description="加入電台清單 Add to radio list（YouTube URL 或關鍵字 / keyword or URL）")
-@app_commands.describe(query="YouTube URL 或關鍵字（支援中文 / keyword or URL）")
+@bot.tree.command(name="radio_add", description="加入電台清單（YouTube URL 或關鍵字）")
+@app_commands.describe(query="YouTube URL 或關鍵字（支援中文）")
 async def radio_add(interaction: discord.Interaction, query: str):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -839,16 +874,15 @@ async def radio_add(interaction: discord.Interaction, query: str):
 
     await interaction.response.send_message(f"✅ 已加入電台清單：`{query}`")
 
+    # if bot already in voice, start if idle
     state = get_state(guild_id)
     state.text_channel_id = interaction.channel_id
     try:
-        vc = await ensure_voice(interaction)
-        if vc:
-            await start_autoplay_if_needed(interaction.guild)
+        await start_autoplay_if_needed(interaction.guild)
     except Exception:
         pass
 
-@bot.tree.command(name="radio_list", description="查看電台清單 View radio list")
+@bot.tree.command(name="radio_list", description="查看電台清單")
 async def radio_list(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -861,7 +895,7 @@ async def radio_list(interaction: discord.Interaction):
     more = f"\n... 還有 {len(radio)-15} 筆" if len(radio) > 15 else ""
     await interaction.response.send_message("📻 電台清單：\n" + "\n".join(lines) + more, ephemeral=True)
 
-@bot.tree.command(name="radio_clear", description="清空電台清單 Clear radio list")
+@bot.tree.command(name="radio_clear", description="清空電台清單")
 async def radio_clear(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("請在伺服器內使用。", ephemeral=True)
@@ -877,49 +911,32 @@ async def radio_clear(interaction: discord.Interaction):
 # =========================
 # Slash: Help
 # =========================
-@bot.tree.command(name="help", description="查看使用說明 Show help")
+@bot.tree.command(name="help", description="查看使用說明")
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🤖 MusicBot 使用說明 / Help",
-        description=(
-            "每日打卡、排行榜、音樂播放、電台自動播放、24/7 背景播放\n"
-            "Daily check-in, leaderboard, music playback, auto radio, 24/7 mode"
-        ),
+        title="🤖 MusicBot 使用說明",
+        description="音樂播放、電台自動播放、24/7 背景播放",
         color=0x5865F2
     )
     embed.add_field(
-        name="🎵 專屬音樂頻道 / Music Channel",
-        value=(
-            "`/setup <頻道>` 設定專屬音樂頻道\n"
-            "設定後在該頻道直接輸入歌名或 URL 即可播放！"
-        ),
+        name="🎵 專屬音樂頻道",
+        value="`/setup <頻道>` 設定後，在該頻道直接輸入歌名或 URL 即可播放！",
         inline=False
     )
     embed.add_field(
-        name="🎵 手動點歌 / Manual Play",
-        value=(
-            "`/play <關鍵字或URL>` 點歌\n"
-            "`/queue` 清單　`/skip` 跳過　`/clear` 清空　`/stop` 停止\n"
-            "`/pause` 暫停　`/resume` 繼續\n"
-            "`/loop` 循環　`/autoplay` 自動選歌"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="📻 電台 / Radio",
+        name="📻 電台",
         value="`/radio_add` 加入　`/radio_list` 查看　`/radio_clear` 清空",
         inline=False
     )
     embed.add_field(
-        name="♾️ 24/7 & 打卡",
-        value="`/24_7 on/off`　`/checkin`　`/leaderboard`",
+        name="♾️ 24/7",
+        value="`/24_7 on/off`",
         inline=False
     )
-    embed.set_footer(text="Now Playing 訊息下方有 ⏸️ ⏭️ 🔁 🎲 ⏹️ 控制按鈕")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # =========================
-# Keep-alive（用 aiohttp 在 asyncio 主循環跑，Render 必須有 HTTP 回應）
+# Keep-alive
 # =========================
 from aiohttp import web as aio_web
 
@@ -937,9 +954,6 @@ async def main():
     await _keepalive_server()
     await bot.start(TOKEN)
 
-# =========================
-# Run
-# =========================
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN not set in .env")
